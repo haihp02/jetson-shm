@@ -7,14 +7,19 @@ processes a zero-copy view of the same physical DRAM on Jetson Orin.
 Uses CuPy to wrap the raw GPU pointer — this is the true zero-copy path.
 torch.as_tensor().cuda() is intentionally avoided as it always memcpy's.
 
-Test A — CPU writes, GPU reads (via CuPy → torch, zero-copy):
+Test A — correctness check (single pass):
   client writes known values via numpy → server reads via cupy/torch tensor
 
-Test B — server writes via CPU, client reads:
+Test B — correctness check (single pass):
   server writes via CPU numpy → client reads same bytes
+
+Test C — loop benchmark (N iterations, profiled via nsys):
+  client writes obs → server reads via GPU → server writes act → client reads
+  No timing in script — use nsys stats for latency analysis
 
 Run:
   python test_jetson_shm.py
+  nsys profile --trace=cuda python test_jetson_shm.py
 """
 
 import ctypes
@@ -29,16 +34,18 @@ import posix_ipc
 import torch
 
 # ── config ────────────────────────────────────────────────────────────────────
-SHM_NAME   = "/vla_test"
-SEM_A_NAME = "/vla_sem_a"
-SEM_B_NAME = "/vla_sem_b"
-SHAPE      = (4, 7)
-NBYTES     = int(np.prod(SHAPE)) * 4  # float32
+SHM_NAME    = "/vla_test"
+SEM_A_NAME  = "/vla_sem_a"
+SEM_B_NAME  = "/vla_sem_b"
+SEM_C0_NAME = "/vla_sem_c0"   # client signals server (obs ready)
+SEM_C1_NAME = "/vla_sem_c1"   # server signals client (act ready)
+SHAPE       = (8, 480, 640)
+NBYTES      = int(np.prod(SHAPE)) * 4  # float32
+N_ITERS     = 100
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 def register_cuda(mem: mmap.mmap, nbytes: int):
-    """Pin the mmap region so GPU can access it directly."""
     torch.cuda.init()
     cudart  = ctypes.CDLL("libcudart.so")
     cpu_ptr = ctypes.c_void_p(
@@ -57,20 +64,14 @@ def register_cuda(mem: mmap.mmap, nbytes: int):
 
 
 def make_cpu_array(mem: mmap.mmap, shape: tuple) -> np.ndarray:
-    """Zero-copy numpy view of the shm region."""
     return np.frombuffer(mem, dtype=np.float32).reshape(shape)
 
 
 def make_gpu_tensor(gpu_ptr: ctypes.c_void_p, shape: tuple) -> torch.Tensor:
-    """
-    Wrap raw GPU device pointer as a torch tensor — true zero-copy.
-    Uses CuPy UnownedMemory to avoid any allocation or memcpy.
-    """
     nbytes = int(np.prod(shape)) * 4
     mem    = cp.cuda.UnownedMemory(gpu_ptr.value, nbytes, owner=None)
     memptr = cp.cuda.MemoryPointer(mem, 0)
     arr    = cp.ndarray(shape, dtype=cp.float32, memptr=memptr)
-    # torch.as_tensor from a CuPy array uses __cuda_array_interface__ — no copy
     return torch.as_tensor(arr, device='cuda')
 
 
@@ -78,10 +79,12 @@ def make_gpu_tensor(gpu_ptr: ctypes.c_void_p, shape: tuple) -> torch.Tensor:
 def server(addr_queue: mp.Queue):
     print("[server] starting")
 
-    shm   = posix_ipc.SharedMemory(SHM_NAME, flags=posix_ipc.O_CREAT, size=NBYTES)
-    mem   = mmap.mmap(shm.fd, NBYTES)
-    sem_a = posix_ipc.Semaphore(SEM_A_NAME, flags=posix_ipc.O_CREAT, initial_value=0)
-    sem_b = posix_ipc.Semaphore(SEM_B_NAME, flags=posix_ipc.O_CREAT, initial_value=0)
+    shm    = posix_ipc.SharedMemory(SHM_NAME, flags=posix_ipc.O_CREAT, size=NBYTES)
+    mem    = mmap.mmap(shm.fd, NBYTES)
+    sem_a  = posix_ipc.Semaphore(SEM_A_NAME,  flags=posix_ipc.O_CREAT, initial_value=0)
+    sem_b  = posix_ipc.Semaphore(SEM_B_NAME,  flags=posix_ipc.O_CREAT, initial_value=0)
+    sem_c0 = posix_ipc.Semaphore(SEM_C0_NAME, flags=posix_ipc.O_CREAT, initial_value=0)
+    sem_c1 = posix_ipc.Semaphore(SEM_C1_NAME, flags=posix_ipc.O_CREAT, initial_value=0)
 
     cudart    = None
     cpu_ptr   = None
@@ -90,22 +93,19 @@ def server(addr_queue: mp.Queue):
     try:
         cudart, cpu_ptr, gpu_ptr = register_cuda(mem, NBYTES)
         cpu_array  = make_cpu_array(mem, SHAPE)
-        gpu_tensor = make_gpu_tensor(gpu_ptr, SHAPE)   # zero-copy GPU view
+        gpu_tensor = make_gpu_tensor(gpu_ptr, SHAPE)   # torch, used for Test A only
+        cp_array   = cp.ndarray(SHAPE, dtype=cp.float32,
+                        memptr=cp.cuda.MemoryPointer(
+                            cp.cuda.UnownedMemory(gpu_ptr.value, NBYTES, None), 0))
 
         print("[server] shared memory registered with CUDA ✓")
-
-        # Publish addresses to main for the final report
         addr_queue.put({"server_cpu": cpu_ptr.value, "server_gpu": gpu_ptr.value})
 
         # ── Test A: client writes via CPU, server reads via GPU ───────────
         print("[server] TEST A — waiting for client CPU write ...")
         sem_a.acquire()
-
-        # Read directly from gpu_tensor — no memcpy, same physical bytes
-        gpu_vals = gpu_tensor.cpu().numpy()   # .cpu() here is just for printing
+        gpu_vals = gpu_tensor.cpu().numpy()
         expected = np.arange(int(np.prod(SHAPE)), dtype=np.float32).reshape(SHAPE)
-        print(f"[server] GPU tensor read:\n{gpu_vals}")
-
         if np.allclose(gpu_vals, expected):
             print("[server] TEST A PASSED ✓  GPU sees client's CPU write\n")
         else:
@@ -114,8 +114,20 @@ def server(addr_queue: mp.Queue):
         # ── Test B: server writes via CPU, client reads ───────────────────
         print("[server] TEST B — writing 42.0 via CPU into shared memory ...")
         cpu_array[:] = 42.0
-        torch.cuda.synchronize()
         sem_b.release()
+
+        # ── Test C: loop — simulate obs read + act write ──────────────────
+        print(f"[server] TEST C — running {N_ITERS} inference loop iterations ...")
+        for i in range(N_ITERS):
+            sem_c0.acquire()                    # wait for client obs write
+
+            _ = cp_array.sum()                  # GPU reads obs from shm via CuPy (SM 8.7 compatible)
+
+            cpu_array[:] = float(i % 256)      # server writes act back via CPU (immediate)
+
+            sem_c1.release()                    # signal client act is ready
+
+        print("[server] TEST C DONE ✓\n")
 
     finally:
         del cpu_array
@@ -125,6 +137,8 @@ def server(addr_queue: mp.Queue):
         shm.unlink()
         sem_a.unlink()
         sem_b.unlink()
+        sem_c0.unlink()
+        sem_c1.unlink()
         print("[server] cleaned up")
 
 
@@ -133,13 +147,15 @@ def client(addr_queue: mp.Queue):
     time.sleep(0.5)
     print("[client] starting")
 
-    shm       = posix_ipc.SharedMemory(SHM_NAME)
-    mem       = mmap.mmap(shm.fd, NBYTES)
-    sem_a     = posix_ipc.Semaphore(SEM_A_NAME)
-    sem_b     = posix_ipc.Semaphore(SEM_B_NAME)
-    cpu_array = make_cpu_array(mem, SHAPE)
+    shm    = posix_ipc.SharedMemory(SHM_NAME)
+    mem    = mmap.mmap(shm.fd, NBYTES)
+    sem_a  = posix_ipc.Semaphore(SEM_A_NAME)
+    sem_b  = posix_ipc.Semaphore(SEM_B_NAME)
+    sem_c0 = posix_ipc.Semaphore(SEM_C0_NAME)
+    sem_c1 = posix_ipc.Semaphore(SEM_C1_NAME)
 
-    cpu_ptr = ctypes.c_void_p(
+    cpu_array = make_cpu_array(mem, SHAPE)
+    cpu_ptr   = ctypes.c_void_p(
         ctypes.addressof(ctypes.c_char.from_buffer(mem))
     )
     addr_queue.put({"client_cpu": cpu_ptr.value})
@@ -152,13 +168,20 @@ def client(addr_queue: mp.Queue):
 
     # ── Test B ────────────────────────────────────────────────────────────
     sem_b.acquire()
-    cpu_vals = cpu_array.copy()
-    print(f"[client] CPU array read:\n{cpu_vals}")
-
-    if np.all(cpu_vals == 42.0):
+    if np.all(cpu_array == 42.0):
         print("[client] TEST B PASSED ✓  client sees server's write\n")
     else:
         print("[client] TEST B FAILED ✗\n")
+
+    # ── Test C: loop — simulate obs write + act read ──────────────────────
+    print(f"[client] TEST C — running {N_ITERS} control loop iterations ...")
+    for i in range(N_ITERS):
+        cpu_array[:] = float(i % 256)          # client writes obs via CPU
+        sem_c0.release()                        # signal server obs is ready
+
+        sem_c1.acquire()                        # wait for server act
+
+    print("[client] TEST C DONE ✓\n")
 
     del cpu_array
     mem.close()
@@ -212,7 +235,7 @@ if __name__ == "__main__":
     for name in [SHM_NAME]:
         try: posix_ipc.SharedMemory(name).unlink()
         except: pass
-    for name in [SEM_A_NAME, SEM_B_NAME]:
+    for name in [SEM_A_NAME, SEM_B_NAME, SEM_C0_NAME, SEM_C1_NAME]:
         try: posix_ipc.Semaphore(name).unlink()
         except: pass
 
@@ -221,7 +244,8 @@ if __name__ == "__main__":
         sys.exit(1)
 
     print(f"Device      : {torch.cuda.get_device_name(0)}")
-    print(f"Array shape : {SHAPE}, {NBYTES} bytes\n")
+    print(f"Array shape : {SHAPE}, {NBYTES} bytes")
+    print(f"Loop iters  : {N_ITERS}\n")
     print("=" * 55)
 
     addr_queue = mp.Queue()
