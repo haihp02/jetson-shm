@@ -19,6 +19,9 @@ uv pip install "cupy-cuda12x>=13.0.0,<14.0.0"
 # other deps
 uv pip install posix-ipc
 
+# ZMQ baseline test deps (test_zmq_baseline.py)
+uv pip install pyzmq msgpack
+
 echo ""
 echo "=== Verifying install ==="
 python - << 'PYEOF'
